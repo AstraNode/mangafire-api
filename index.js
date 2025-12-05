@@ -11,22 +11,27 @@ const BASE_URL = 'https://mangafire.to';
 app.use(cors());
 app.use(express.json());
 
-// Browser Options Configuration
+// Browser Configuration
 const getBrowserOptions = async () => {
-    // If running locally, use full puppeteer. If on Vercel, use chromium layer.
-    const isLocal = !process.env.AWS_REGION && !process.env.VERCEL;
+    // Check if running on Vercel or AWS Lambda
+    const isServerless = process.env.VERCEL || process.env.AWS_REGION;
     
-    if (isLocal) {
+    if (!isServerless) {
+        // Local Development
         return {
             executablePath: require('puppeteer').executablePath(),
             args: ['--no-sandbox', '--disable-setuid-sandbox'],
             headless: "new"
         };
     } else {
+        // Vercel / Production
+        // Force graphics mode off to ensure compatibility
+        chromium.setGraphicsMode = false;
+        
         return {
-            executablePath: await chromium.executablePath(),
-            args: chromium.args,
+            args: [...chromium.args, '--hide-scrollbars', '--disable-web-security'],
             defaultViewport: chromium.defaultViewport,
+            executablePath: await chromium.executablePath(),
             headless: chromium.headless,
             ignoreHTTPSErrors: true,
         };
@@ -41,29 +46,26 @@ const runPuppeteer = async (url, type = 'html') => {
         browser = await puppeteer.launch(options);
         const page = await browser.newPage();
         
-        // Mimic real user
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
+        // Mimic real user to bypass Cloudflare
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
         
-        // Optimize: Block images/fonts to save bandwidth
+        // Optimize: Block heavy resources
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
                 req.abort();
             } else {
                 req.continue();
             }
         });
 
-        // Go to URL
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        // Navigate
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 }); // Increased timeout
 
-        // If we just need the HTML
+        // Return Data
         if (type === 'html') {
-            const content = await page.content();
-            return content;
+            return await page.content();
         } 
-        
-        // If we need JSON (for AJAX calls), we extract it from body
         if (type === 'json') {
             const content = await page.evaluate(() => document.body.innerText);
             return JSON.parse(content);
@@ -71,13 +73,12 @@ const runPuppeteer = async (url, type = 'html') => {
 
     } catch (error) {
         console.error("Puppeteer Error:", error.message);
-        throw error;
+        throw error; // Propagate error to route handler
     } finally {
         if (browser) await browser.close();
     }
 };
 
-// Helper: Extract ID
 const extractId = (url) => url ? url.split('.').pop() : null;
 
 // ==========================================
@@ -86,6 +87,7 @@ const extractId = (url) => url ? url.split('.').pop() : null;
 app.get('/api/search/:keyword', async (req, res) => {
     try {
         const { keyword } = req.params;
+        // Fix: Use correct URL encoding
         const html = await runPuppeteer(`${BASE_URL}/filter?keyword=${encodeURIComponent(keyword)}`);
         const $ = cheerio.load(html);
         const results = [];
@@ -116,7 +118,6 @@ app.get('/api/search/:keyword', async (req, res) => {
 app.get('/api/manga/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        // Search by ID trick to get to the page
         const html = await runPuppeteer(`${BASE_URL}/manga/dummy.${id}`);
         const $ = cheerio.load(html);
 
@@ -140,7 +141,7 @@ app.get('/api/manga/:id', async (req, res) => {
             banner: image
         });
     } catch (error) {
-        res.status(500).json({ error: 'Details failed' });
+        res.status(500).json({ error: 'Details failed', details: error.message });
     }
 });
 
@@ -152,7 +153,6 @@ app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
         const { id } = req.params;
         const lang = req.params.lang || 'en';
         
-        // Fetch the AJAX endpoint directly using Puppeteer to handle cookies
         const data = await runPuppeteer(`${BASE_URL}/ajax/manga/${id}/chapter/${lang}`, 'json');
         
         if (data.status !== 200) throw new Error('API Error');
@@ -179,7 +179,8 @@ app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
 
         res.json(chapters);
     } catch (error) {
-        res.json([]); // Return empty on fail
+        console.error(error);
+        res.json([]);
     }
 });
 
@@ -192,18 +193,17 @@ app.get('/api/chapter/:id', async (req, res) => {
         const data = await runPuppeteer(`${BASE_URL}/ajax/read/chapter/${id}`, 'json');
 
         if (data.status === 200 && data.result && data.result.images) {
-            // Flatten images array [[url, w, h], ...] -> [url, ...]
             const images = data.result.images.map(img => Array.isArray(img) ? img[0] : img);
             res.json(images);
         } else {
             throw new Error('Invalid structure');
         }
     } catch (error) {
-        res.status(500).json({ error: 'Images failed' });
+        res.status(500).json({ error: 'Images failed', details: error.message });
     }
 });
 
-app.get('/', (req, res) => res.send('MangaFire Puppeteer API is Running!'));
+app.get('/', (req, res) => res.send('MangaFire Puppeteer API (Fixed) is Running!'));
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
