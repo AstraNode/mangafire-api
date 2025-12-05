@@ -1,8 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+const axios = require('axios');
 const cheerio = require('cheerio');
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,86 +11,32 @@ const BASE_URL = 'https://mangafire.to';
 app.use(cors());
 app.use(express.json());
 
-// Browser Configuration
-const getBrowserOptions = async () => {
-    // Check if running on Vercel (Production)
-    // Vercel usually defines process.env.VERCEL or AWS_LAMBDA_FUNCTION_NAME
-    const isProduction = process.env.VERCEL || process.env.AWS_REGION;
-    
-    if (!isProduction) {
-        // Local Development (Uses your local Chrome)
-        // You might need to install 'puppeteer' devDependency for local testing if you haven't
-        return {
-            executablePath: require('puppeteer').executablePath(), 
-            args: ['--no-sandbox', '--disable-setuid-sandbox'],
-            headless: "new"
-        };
-    } else {
-        // Vercel Production Configuration
-        // This sets up the compressed Chromium binary
-        chromium.setGraphicsMode = false;
-        
-        return {
-            args: chromium.args,
-            defaultViewport: chromium.defaultViewport,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
-            ignoreHTTPSErrors: true,
-        };
+// 1. CONFIGURATION
+// You get these from your browser (F12 -> Network -> Click 'mangafire.to' -> Request Headers)
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
+const COOKIE = process.env.MANGAFIRE_COOKIE || ""; // Read from Env Var
+
+const client = axios.create({
+    baseURL: BASE_URL,
+    headers: {
+        'User-Agent': USER_AGENT,
+        'Cookie': COOKIE,
+        'Referer': BASE_URL,
+        'X-Requested-With': 'XMLHttpRequest'
     }
-};
+});
 
-// Helper: Run Puppeteer Task
-const runPuppeteer = async (url, type = 'html') => {
-    let browser = null;
-    try {
-        const options = await getBrowserOptions();
-        browser = await puppeteer.launch(options);
-        const page = await browser.newPage();
-        
-        // Mimic real user
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
-        
-        // Block heavy resources to save memory/speed
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
-
-        // Navigate
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-
-        // Return Data
-        if (type === 'html') {
-            return await page.content();
-        } 
-        if (type === 'json') {
-            const content = await page.evaluate(() => document.body.innerText);
-            return JSON.parse(content);
-        }
-
-    } catch (error) {
-        console.error("Puppeteer Error:", error.message);
-        throw error;
-    } finally {
-        if (browser) await browser.close();
-    }
-};
-
+// Helper: Extract ID
 const extractId = (url) => url ? url.split('.').pop() : null;
 
 // ==========================================
-// 1. SEARCH
+// SEARCH
 // ==========================================
 app.get('/api/search/:keyword', async (req, res) => {
     try {
         const { keyword } = req.params;
-        const html = await runPuppeteer(`${BASE_URL}/filter?keyword=${encodeURIComponent(keyword)}`);
-        const $ = cheerio.load(html);
+        const { data } = await client.get(`/filter?keyword=${encodeURIComponent(keyword)}`);
+        const $ = cheerio.load(data);
         const results = [];
 
         $('.original .unit').each((i, el) => {
@@ -103,31 +49,36 @@ app.get('/api/search/:keyword', async (req, res) => {
             const status = $el.find('.status').text().trim();
 
             if (id && title) {
-                results.push({ id, title, image, type, status, link: `${BASE_URL}${link}` });
+                results.push({ id, title, image, type, status });
             }
         });
 
         res.json(results);
     } catch (error) {
-        res.status(500).json({ error: 'Search failed', details: error.message });
+        // If 403, it means Cookie is invalid
+        if (error.response && error.response.status === 403) {
+            return res.status(403).json({ error: 'Cloudflare blocked request. Please update MANGAFIRE_COOKIE in Vercel.' });
+        }
+        res.status(500).json({ error: error.message });
     }
 });
 
 // ==========================================
-// 2. MANGA DETAILS
+// MANGA DETAILS
 // ==========================================
 app.get('/api/manga/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const html = await runPuppeteer(`${BASE_URL}/manga/dummy.${id}`);
-        const $ = cheerio.load(html);
+        const { data } = await client.get(`/manga/dummy.${id}`);
+        const $ = cheerio.load(data);
 
         const title = $('h1[itemprop="name"]').text().trim();
         const image = $('.poster img').attr('src');
         const description = $('.description').text().trim();
         const genres = [];
         $('.meta .genres a').each((i, el) => genres.push($(el).text().trim()));
-        
+
+        // Helper to grab sidebar info
         const getMeta = (label) => $('.meta span').filter((i, el) => $(el).text().includes(label)).next().text().trim();
 
         res.json({
@@ -142,19 +93,20 @@ app.get('/api/manga/:id', async (req, res) => {
             banner: image
         });
     } catch (error) {
-        res.status(500).json({ error: 'Details failed', details: error.message });
+        res.status(500).json({ error: 'Details failed' });
     }
 });
 
 // ==========================================
-// 3. GET CHAPTERS
+// CHAPTER LIST (AJAX)
 // ==========================================
 app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
     try {
         const { id } = req.params;
         const lang = req.params.lang || 'en';
         
-        const data = await runPuppeteer(`${BASE_URL}/ajax/manga/${id}/chapter/${lang}`, 'json');
+        // MangaFire AJAX call
+        const { data } = await client.get(`/ajax/manga/${id}/chapter/${lang}`);
         
         if (data.status !== 200) throw new Error('API Error');
 
@@ -164,13 +116,14 @@ app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
         $('.item').each((i, el) => {
             const $el = $(el);
             const link = $el.find('a').attr('href');
+            // ID for fetching images is inside data-id attribute
             const id = $el.find('a').attr('data-id');
             const number = $el.find('a').attr('data-number');
             const title = $el.find('span').first().text().trim();
 
             if (id) {
                 chapters.push({
-                    id,
+                    id, // Important: This is the internal ID for images
                     number,
                     title: title || `Chapter ${number}`,
                     url: `${BASE_URL}${link}`
@@ -180,30 +133,33 @@ app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
 
         res.json(chapters);
     } catch (error) {
+        console.error(error);
         res.json([]);
     }
 });
 
 // ==========================================
-// 4. GET IMAGES
+// CHAPTER IMAGES (AJAX)
 // ==========================================
 app.get('/api/chapter/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const data = await runPuppeteer(`${BASE_URL}/ajax/read/chapter/${id}`, 'json');
+        // The ID here must be the internal data-id we fetched in the chapter list
+        const { data } = await client.get(`/ajax/read/chapter/${id}`);
 
         if (data.status === 200 && data.result && data.result.images) {
+            // Flatten images [[url, w, h], ...] -> [url, ...]
             const images = data.result.images.map(img => Array.isArray(img) ? img[0] : img);
             res.json(images);
         } else {
-            throw new Error('Invalid structure');
+            throw new Error('No images found');
         }
     } catch (error) {
-        res.status(500).json({ error: 'Images failed', details: error.message });
+        res.status(500).json({ error: 'Images failed' });
     }
 });
 
-app.get('/', (req, res) => res.send('MangaFire Puppeteer API (v2 Stable) is Running!'));
+app.get('/', (req, res) => res.send('MangaFire Lightweight API is Running!'));
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
