@@ -13,23 +13,25 @@ app.use(express.json());
 
 // Browser Configuration
 const getBrowserOptions = async () => {
-    // Check if running on Vercel or AWS Lambda
-    const isServerless = process.env.VERCEL || process.env.AWS_REGION;
+    // Check if running on Vercel (Production)
+    // Vercel usually defines process.env.VERCEL or AWS_LAMBDA_FUNCTION_NAME
+    const isProduction = process.env.VERCEL || process.env.AWS_REGION;
     
-    if (!isServerless) {
-        // Local Development
+    if (!isProduction) {
+        // Local Development (Uses your local Chrome)
+        // You might need to install 'puppeteer' devDependency for local testing if you haven't
         return {
-            executablePath: require('puppeteer').executablePath(),
+            executablePath: require('puppeteer').executablePath(), 
             args: ['--no-sandbox', '--disable-setuid-sandbox'],
             headless: "new"
         };
     } else {
-        // Vercel / Production
-        // Force graphics mode off to ensure compatibility
+        // Vercel Production Configuration
+        // This sets up the compressed Chromium binary
         chromium.setGraphicsMode = false;
         
         return {
-            args: [...chromium.args, '--hide-scrollbars', '--disable-web-security'],
+            args: chromium.args,
             defaultViewport: chromium.defaultViewport,
             executablePath: await chromium.executablePath(),
             headless: chromium.headless,
@@ -46,10 +48,10 @@ const runPuppeteer = async (url, type = 'html') => {
         browser = await puppeteer.launch(options);
         const page = await browser.newPage();
         
-        // Mimic real user to bypass Cloudflare
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
+        // Mimic real user
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
         
-        // Optimize: Block heavy resources
+        // Block heavy resources to save memory/speed
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
@@ -60,7 +62,7 @@ const runPuppeteer = async (url, type = 'html') => {
         });
 
         // Navigate
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 }); // Increased timeout
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
 
         // Return Data
         if (type === 'html') {
@@ -73,7 +75,7 @@ const runPuppeteer = async (url, type = 'html') => {
 
     } catch (error) {
         console.error("Puppeteer Error:", error.message);
-        throw error; // Propagate error to route handler
+        throw error;
     } finally {
         if (browser) await browser.close();
     }
@@ -87,7 +89,6 @@ const extractId = (url) => url ? url.split('.').pop() : null;
 app.get('/api/search/:keyword', async (req, res) => {
     try {
         const { keyword } = req.params;
-        // Fix: Use correct URL encoding
         const html = await runPuppeteer(`${BASE_URL}/filter?keyword=${encodeURIComponent(keyword)}`);
         const $ = cheerio.load(html);
         const results = [];
@@ -179,7 +180,6 @@ app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
 
         res.json(chapters);
     } catch (error) {
-        console.error(error);
         res.json([]);
     }
 });
@@ -203,7 +203,7 @@ app.get('/api/chapter/:id', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.send('MangaFire Puppeteer API (Fixed) is Running!'));
+app.get('/', (req, res) => res.send('MangaFire Puppeteer API (v2 Stable) is Running!'));
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
