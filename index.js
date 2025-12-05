@@ -12,9 +12,8 @@ app.use(cors());
 app.use(express.json());
 
 // 1. CONFIGURATION
-// You get these from your browser (F12 -> Network -> Click 'mangafire.to' -> Request Headers)
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
-const COOKIE = process.env.MANGAFIRE_COOKIE || ""; // Read from Env Var
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const COOKIE = process.env.MANGAFIRE_COOKIE || ""; 
 
 const client = axios.create({
     baseURL: BASE_URL,
@@ -22,11 +21,12 @@ const client = axios.create({
         'User-Agent': USER_AGENT,
         'Cookie': COOKIE,
         'Referer': BASE_URL,
-        'X-Requested-With': 'XMLHttpRequest'
-    }
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+    },
+    validateStatus: false // Prevent axios from crashing on 404/403
 });
 
-// Helper: Extract ID
 const extractId = (url) => url ? url.split('.').pop() : null;
 
 // ==========================================
@@ -35,10 +35,20 @@ const extractId = (url) => url ? url.split('.').pop() : null;
 app.get('/api/search/:keyword', async (req, res) => {
     try {
         const { keyword } = req.params;
-        const { data } = await client.get(`/filter?keyword=${encodeURIComponent(keyword)}`);
+        const { data, status } = await client.get(`/filter?keyword=${encodeURIComponent(keyword)}`);
+        
         const $ = cheerio.load(data);
-        const results = [];
+        const pageTitle = $('title').text().trim();
 
+        // CHECK FOR CLOUDFLARE BLOCK
+        if (pageTitle.includes('Just a moment') || status === 403) {
+            return res.status(403).json({ 
+                error: 'Cloudflare Blocked Request', 
+                message: 'Please update MANGAFIRE_COOKIE in Vercel environment variables.' 
+            });
+        }
+
+        const results = [];
         $('.original .unit').each((i, el) => {
             const $el = $(el);
             const link = $el.find('a').attr('href');
@@ -46,19 +56,15 @@ app.get('/api/search/:keyword', async (req, res) => {
             const image = $el.find('img').attr('src');
             const title = $el.find('.info a').first().text().trim();
             const type = $el.find('.type').text().trim();
-            const status = $el.find('.status').text().trim();
+            const statusText = $el.find('.status').text().trim();
 
             if (id && title) {
-                results.push({ id, title, image, type, status });
+                results.push({ id, title, image, type, status: statusText });
             }
         });
 
         res.json(results);
     } catch (error) {
-        // If 403, it means Cookie is invalid
-        if (error.response && error.response.status === 403) {
-            return res.status(403).json({ error: 'Cloudflare blocked request. Please update MANGAFIRE_COOKIE in Vercel.' });
-        }
         res.status(500).json({ error: error.message });
     }
 });
@@ -69,8 +75,20 @@ app.get('/api/search/:keyword', async (req, res) => {
 app.get('/api/manga/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { data } = await client.get(`/manga/dummy.${id}`);
+        // Search specific ID to handle potential slug mismatches
+        const { data, status } = await client.get(`/manga/dummy.${id}`);
         const $ = cheerio.load(data);
+        const pageTitle = $('title').text().trim();
+
+        // 1. CLOUDFLARE CHECK
+        if (pageTitle.includes('Just a moment') || status === 403) {
+            return res.status(403).json({ error: 'Cloudflare Blocked Request. Update Cookie.' });
+        }
+
+        // 2. 404 CHECK
+        if (status === 404 || pageTitle.includes('404')) {
+            return res.status(404).json({ error: 'Manga not found. Check ID.' });
+        }
 
         const title = $('h1[itemprop="name"]').text().trim();
         const image = $('.poster img').attr('src');
@@ -78,7 +96,6 @@ app.get('/api/manga/:id', async (req, res) => {
         const genres = [];
         $('.meta .genres a').each((i, el) => genres.push($(el).text().trim()));
 
-        // Helper to grab sidebar info
         const getMeta = (label) => $('.meta span').filter((i, el) => $(el).text().includes(label)).next().text().trim();
 
         res.json({
@@ -93,73 +110,70 @@ app.get('/api/manga/:id', async (req, res) => {
             banner: image
         });
     } catch (error) {
-        res.status(500).json({ error: 'Details failed' });
+        res.status(500).json({ error: error.message });
     }
 });
 
 // ==========================================
-// CHAPTER LIST (AJAX)
+// CHAPTER LIST
 // ==========================================
 app.get('/api/manga/:id/chapters/:lang?', async (req, res) => {
     try {
         const { id } = req.params;
         const lang = req.params.lang || 'en';
         
-        // MangaFire AJAX call
         const { data } = await client.get(`/ajax/manga/${id}/chapter/${lang}`);
         
-        if (data.status !== 200) throw new Error('API Error');
+        // API returns JSON, no need to load cheerio on 'data' directly
+        if (data.result) {
+            const $ = cheerio.load(data.result);
+            const chapters = [];
 
-        const $ = cheerio.load(data.result);
-        const chapters = [];
+            $('.item').each((i, el) => {
+                const $el = $(el);
+                const link = $el.find('a').attr('href');
+                const id = $el.find('a').attr('data-id');
+                const number = $el.find('a').attr('data-number');
+                const title = $el.find('span').first().text().trim();
 
-        $('.item').each((i, el) => {
-            const $el = $(el);
-            const link = $el.find('a').attr('href');
-            // ID for fetching images is inside data-id attribute
-            const id = $el.find('a').attr('data-id');
-            const number = $el.find('a').attr('data-number');
-            const title = $el.find('span').first().text().trim();
-
-            if (id) {
-                chapters.push({
-                    id, // Important: This is the internal ID for images
-                    number,
-                    title: title || `Chapter ${number}`,
-                    url: `${BASE_URL}${link}`
-                });
-            }
-        });
-
-        res.json(chapters);
-    } catch (error) {
-        console.error(error);
+                if (id) {
+                    chapters.push({
+                        id,
+                        number,
+                        title: title || `Chapter ${number}`,
+                        url: `${BASE_URL}${link}`
+                    });
+                }
+            });
+            return res.json(chapters);
+        }
+        
         res.json([]);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
 // ==========================================
-// CHAPTER IMAGES (AJAX)
+// CHAPTER IMAGES
 // ==========================================
 app.get('/api/chapter/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        // The ID here must be the internal data-id we fetched in the chapter list
         const { data } = await client.get(`/ajax/read/chapter/${id}`);
 
-        if (data.status === 200 && data.result && data.result.images) {
-            // Flatten images [[url, w, h], ...] -> [url, ...]
+        if (data.result && data.result.images) {
             const images = data.result.images.map(img => Array.isArray(img) ? img[0] : img);
             res.json(images);
         } else {
-            throw new Error('No images found');
+            res.status(404).json({ error: 'No images found' });
         }
     } catch (error) {
-        res.status(500).json({ error: 'Images failed' });
+        res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/', (req, res) => res.send('MangaFire Lightweight API is Running!'));
+app.get('/', (req, res) => res.send('API Running'));
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
